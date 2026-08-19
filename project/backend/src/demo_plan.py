@@ -1,97 +1,137 @@
-"""Demo plan for Emergency Control — no AI, handcrafted for frontend testing."""
+"""El planificador: Nodo de búsqueda, Uniform Cost Search y construcción del plan.
 
+Consume el modelo de búsqueda de simulator.py (State, ScenarioIndex,
+get_successors) y produce un plan óptimo ya traducido al contrato
+(CONTRATO.md). Aquí vive todo lo que es "historial de búsqueda" (g, padre,
+acción) y NO el estado físico — ver design.md, "Nodo vs. Estado".
+
+Ejecutar directo:  python demo_plan.py   (imprime el plan para scenario.json)
+"""
 from __future__ import annotations
 
-from typing import Any
+import heapq
+import itertools
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+from simulator import ActionRecord, ScenarioIndex, State, get_successors, load_scenario, simulate
 
 
-def build_demo_plan(scenario: dict[str, Any]) -> dict[str, Any]:
-    """Plan artesanal para probar el frontend. No es un agente de IA.
+@dataclass
+class Node:
+    """Nodo de búsqueda: contabilidad de UCS. NO es el estado físico."""
 
-    Es legal y recorre todas las ops visuales, pero no es necesariamente
-    óptimo (usa el pasillo caro Z2↔Z5 y por eso recarga). Los DROP no son
-    decorativos: con cargo_capacity=3 hay que hacer hueco. El agente del
-    estudiante debe *descubrir* cuándo soltar, no copiar esta secuencia,
-    y no debe subir la capacidad para evitarlos.
-    """
-    costs = scenario.get("action_costs", {})
-    pickup = costs.get("pickup", 1)
-    drop = costs.get("drop", 1)
-    interact = costs.get("interact", 2)
-    recharge = costs.get("recharge", 3)
+    state: State
+    parent: Optional["Node"]
+    action: Optional[ActionRecord]
+    g: int
+    depth: int = field(default=0)
 
-    def corridor_cost(frm: str, to: str) -> int:
-        for c in scenario["corridors"]:
-            if c["from"] == frm and c["to"] == to:
-                return int(c["cost"])
-        raise ValueError(f"missing corridor {frm}->{to}")
+    def path(self) -> List[ActionRecord]:
+        actions: List[ActionRecord] = []
+        node: Optional[Node] = self
+        while node is not None and node.action is not None:
+            actions.append(node.action)
+            node = node.parent
+        actions.reverse()
+        return actions
 
-    steps: list[dict[str, Any]] = [
-        # --- open path CONTROL -> STORAGE ---
-        {"op": "PICKUP", "item": "KEY1", "cost": pickup},
-        {"op": "INTERACT", "target": "DOOR1", "action": "OPEN_DOOR", "cost": interact},
-        {"op": "MOVE", "from": "Z1", "to": "Z2", "cost": corridor_cost("Z1", "Z2")},
-        # --- gather key2 + fuse (capacity pressure) ---
-        {"op": "PICKUP", "item": "KEY2", "cost": pickup},
-        {"op": "PICKUP", "item": "FUSE", "cost": pickup},
-        {"op": "DROP", "item": "KEY1", "cost": drop},
-        {"op": "INTERACT", "target": "DOOR2", "action": "OPEN_DOOR", "cost": interact},
-        {"op": "MOVE", "from": "Z2", "to": "Z3", "cost": corridor_cost("Z2", "Z3")},
-        # --- workshop: tool + key3 + recharge ---
-        {"op": "PICKUP", "item": "MULTITOOL", "cost": pickup},
-        {"op": "DROP", "item": "KEY2", "cost": drop},
-        {"op": "PICKUP", "item": "KEY3", "cost": pickup},
-        {"op": "INTERACT", "target": "CHARGER_1", "action": "RECHARGE", "cost": recharge},
-        # --- generator bay ---
-        {"op": "MOVE", "from": "Z3", "to": "Z4", "cost": corridor_cost("Z3", "Z4")},
-        {"op": "INTERACT", "target": "DOOR3", "action": "OPEN_DOOR", "cost": interact},
-        {
-            "op": "INTERACT",
-            "target": "PANEL_A",
-            "action": "REPAIR",
-            "consumes": "FUSE",
-            "cost": interact,
-        },
-        {"op": "INTERACT", "target": "GENERATOR", "action": "ACTIVATE", "cost": interact},
-        # --- fetch remaining tools/materials ---
-        {"op": "MOVE", "from": "Z4", "to": "Z3", "cost": corridor_cost("Z4", "Z3")},
-        {"op": "DROP", "item": "KEY3", "cost": drop},
-        {"op": "DROP", "item": "MULTITOOL", "cost": drop},
-        {"op": "PICKUP", "item": "SOLDERING", "cost": pickup},
-        {"op": "PICKUP", "item": "WIRE_CUTTER", "cost": pickup},
-        {"op": "MOVE", "from": "Z3", "to": "Z2", "cost": corridor_cost("Z3", "Z2")},
-        {"op": "PICKUP", "item": "CHIP", "cost": pickup},
-        {"op": "DROP", "item": "WIRE_CUTTER", "cost": drop},
-        {"op": "PICKUP", "item": "CABLE", "cost": pickup},
-        # --- command deck via expensive outer corridor Z2→Z5 (no door; alternate to Z4→DOOR3→Z5) ---
-        {"op": "MOVE", "from": "Z2", "to": "Z5", "cost": corridor_cost("Z2", "Z5")},
-        {
-            "op": "INTERACT",
-            "target": "PANEL_B",
-            "action": "REPAIR",
-            "consumes": "CHIP",
-            "cost": interact,
-        },
-        {"op": "INTERACT", "target": "COMMAND", "action": "ACTIVATE", "cost": interact},
-        # --- retrieve wire cutter for PANEL_C ---
-        {"op": "DROP", "item": "SOLDERING", "cost": drop},
-        {"op": "MOVE", "from": "Z5", "to": "Z2", "cost": corridor_cost("Z5", "Z2")},
-        {"op": "PICKUP", "item": "WIRE_CUTTER", "cost": pickup},
-        {"op": "MOVE", "from": "Z2", "to": "Z5", "cost": corridor_cost("Z2", "Z5")},
-        {
-            "op": "INTERACT",
-            "target": "PANEL_C",
-            "action": "REPAIR",
-            "consumes": "CABLE",
-            "cost": interact,
-        },
-        {"op": "INTERACT", "target": "ARTILLERY", "action": "ACTIVATE", "cost": interact},
-    ]
 
-    total = sum(int(s["cost"]) for s in steps)
+@dataclass
+class SearchResult:
+    success: bool
+    plan: List[ActionRecord]
+    cost: int
+    expanded: int
+    reason: Optional[str] = None
+
+
+def _dominates(g1: int, b1: int, g2: int, b2: int) -> bool:
+    """design.md "Batería como recurso": (g1,B1) domina a (g2,B2) sii g1<=g2 y B1>=B2."""
+    return g1 <= g2 and b1 >= b2
+
+
+def uniform_cost_search(idx: ScenarioIndex) -> SearchResult:
+    """UCS sobre Graph-Search con control de dominancia por batería en CLOSED."""
+    start = idx.initial_state()
+    counter = itertools.count()
+    root = Node(state=start, parent=None, action=None, g=0, depth=0)
+
+    frontier: List[Tuple[int, int, Node]] = [(0, next(counter), root)]
+    # CLOSED: firma lógica <P,C,E,M> -> lista de puntos Pareto (g, battery) ya resueltos
+    closed: Dict[Tuple, List[Tuple[int, int]]] = {}
+    expanded = 0
+
+    def is_dominated(sig: Tuple, g: int, battery: int) -> bool:
+        return any(_dominates(g2, b2, g, battery) for g2, b2 in closed.get(sig, []))
+
+    def register(sig: Tuple, g: int, battery: int) -> None:
+        points = closed.setdefault(sig, [])
+        points[:] = [(g2, b2) for g2, b2 in points if not _dominates(g, battery, g2, b2)]
+        points.append((g, battery))
+
+    while frontier:
+        g, _, node = heapq.heappop(frontier)
+        sig = node.state.signature()
+
+        if is_dominated(sig, node.g, node.state.battery):
+            continue  # llegó un camino mejor (o igual) antes: descartar sin perder optimalidad
+
+        if idx.is_goal(node.state):
+            return SearchResult(success=True, plan=node.path(), cost=node.g, expanded=expanded)
+
+        register(sig, node.g, node.state.battery)
+        expanded += 1
+
+        for action, succ_state in get_successors(idx, node.state):
+            new_g = node.g + action.cost
+            succ_sig = succ_state.signature()
+            if is_dominated(succ_sig, new_g, succ_state.battery):
+                continue
+            child = Node(state=succ_state, parent=node, action=action, g=new_g, depth=node.depth + 1)
+            heapq.heappush(frontier, (new_g, next(counter), child))
+
+    return SearchResult(success=False, plan=[], cost=0, expanded=expanded, reason="FAILURE: no existe plan que satisfaga Goal(s)")
+
+
+def build_plan(scenario_path: Optional[str] = None, scenario_raw: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Función usada por main.py: carga el escenario, busca con UCS, valida
+    el plan contra el simulador de referencia y arma la respuesta del contrato."""
+    raw = scenario_raw if scenario_raw is not None else load_scenario(scenario_path)
+    idx = ScenarioIndex(raw)
+    result = uniform_cost_search(idx)
+
+    if not result.success:
+        return {"solution_found": False, "total_cost": 0, "steps": [], "message": result.reason}
+
+    steps = [a.step for a in result.plan]
+
+    # Red de seguridad: el plan que UCS cree óptimo debe ser legal según el
+    # validador de referencia (mismas reglas que usará el banco de pruebas).
+    try:
+        final_state = simulate(raw, steps)
+        assert final_state["battery"] >= 0
+        assert all(
+            final_state["stations"][sid] == "ONLINE" for sid in raw["goal"]["stations_online"]
+        ), "goal no satisfecho tras simular el plan"
+        message = f"Plan óptimo (UCS): {len(steps)} pasos, costo {result.cost}."
+    except AssertionError as exc:  # pragma: no cover - señal de bug en get_successors
+        return {
+            "solution_found": False,
+            "total_cost": 0,
+            "steps": [],
+            "message": f"El plan encontrado no pasó la verificación de legalidad: {exc}",
+        }
+
     return {
         "solution_found": True,
-        "total_cost": total,
+        "total_cost": result.cost,
         "steps": steps,
-        "message": "Demo plan (no search). Exercises all frontend operations.",
+        "message": message,
     }
+
+
+if __name__ == "__main__":
+    import json
+
+    print(json.dumps(build_plan(), indent=2, ensure_ascii=False))

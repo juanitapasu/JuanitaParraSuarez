@@ -1,50 +1,44 @@
-"""FastAPI backend — demo solver for frontend integration testing."""
+"""API del Planificador Autónomo de Operaciones Críticas.
 
+POST /api/solve  ->  ejecuta uniform_cost_search sobre un escenario recibido
+en el body (o sobre scenarios/scenario.json si el body no trae "scenario"),
+y devuelve la respuesta en el formato exacto de CONTRATO.md §2.
+
+Ejecutar (desde backend/):  uvicorn main:app --app-dir src --port 8000
+"""
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from demo_plan import build_demo_plan
+from demo_plan import build_plan
 
-app = FastAPI(title="Emergency Control API", version="1.0.0")
+app = FastAPI(title="Emergency Control - Planificador Autónomo", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-SCENARIO_PATH = Path(__file__).resolve().parents[2] / "scenarios" / "scenario.json"
 
-
-def _load_default_scenario() -> dict[str, Any]:
-    with SCENARIO_PATH.open(encoding="utf-8") as f:
-        return json.load(f)
-
-
-@app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.get("/api/scenario")
-def get_scenario() -> dict[str, Any]:
-    return _load_default_scenario()
+class SolveRequest(BaseModel):
+    scenario: Optional[Dict[str, Any]] = None
+    scenario_path: Optional[str] = None
 
 
 @app.post("/api/solve")
-def solve(scenario: dict[str, Any]) -> dict[str, Any]:
-    """Return a demo plan consistent with the provided scenario.
+def solve(payload: SolveRequest = SolveRequest()) -> Dict[str, Any]:
+    try:
+        return build_plan(scenario_path=payload.scenario_path, scenario_raw=payload.scenario)
+    except (FileNotFoundError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=f"Escenario inválido: {exc}") from exc
 
-    Students replace this with a real UCS/search agent. The response contract
-    must remain: solution_found, total_cost, steps[{op, cost, ...}].
-    """
-    data = scenario if scenario else _load_default_scenario()
-    return build_demo_plan(data)
+
+@app.get("/api/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
